@@ -86,7 +86,7 @@ int main(int argc, char* argv[]) {
         ("help,h", "produce help message")  //
         ("preserve,p", po::bool_switch(),
          "preserve temporary files and directories")  //
-        ("threads,t", po::value<int>(&ctx.threads)->default_value(128),
+        ("threads,t", po::value<int>(&ctx.threads)->default_value(4),
          "the number of concurrent commands to issue")  //
         ("verbose,v", po::bool_switch(),
          "show verbose output")  //
