@@ -114,11 +114,18 @@ int main(int argc, char* argv[]) {
 
     cleanup = [&]() {
         VERBOSE(ctx, "cleanup");
+        sleep(1);
         VERBOSE(ctx, "unmount all NFS mounts");
-        bp::system("umount -a -t nfs -l");
+        bp::system("umount -a -t nfs");
+        bp::system("umount -a -t nfs4");
         VERBOSE(ctx, "remove export file");
         fs::remove(exports);
         exportfs(ctx);
+        VERBOSE(ctx, "remove bind mounts");
+        bp::system(
+            "bash -c \"mount |grep tmpfs | grep paramount | awk '{print $3}' "
+            "| xargs "
+            "-rn 1 umount\"");
         VERBOSE(ctx, "remove temp dir");
         tdobj.DeleteNow();
     };
@@ -136,6 +143,12 @@ int main(int argc, char* argv[]) {
         // Map from mount to client mountpoint.
         std::unordered_map<std::string, std::string> m_to_c{};
 
+        // Create a list of directory stem names, 'd1234' etc.
+        auto dirname = std::vector<std::string>{};
+        for (int d = 0; d < ctx.threads; d++) {
+            dirname.push_back(fmt::format(FMT_STRING("d{:04}"), d));
+        }
+
         // Create mount directories.
         auto mountdir = tmpdir / "mount";
         if (!fs::create_directory(mountdir, ec)) {
@@ -145,7 +158,7 @@ int main(int argc, char* argv[]) {
 
         auto mdir = std::vector<fs::path>{};
         for (int d = 0; d < ctx.threads; d++) {
-            auto newdir = mountdir / fmt::format(FMT_STRING("d{:04}"), d);
+            auto newdir = mountdir / dirname[d];
             if (!fs::create_directory(newdir, ec)) {
                 EFMT_SYS(ec.value(), "Failed to create mount directory {}",
                          newdir.native());
@@ -154,23 +167,55 @@ int main(int argc, char* argv[]) {
             mdir.push_back(newdir);
         }
 
+        auto mountp = bp::search_path("mount");
+
+        auto exdir = tmpdir / "export";
+        if (!fs::create_directory(exdir, ec)) {
+            EFMT_SYS(ec.value(), "Failed to create export root directory {}",
+                     exdir.native());
+        }
+
+        // Create bind mounts.
+        for (int d = 0; d < ctx.threads; d++) {
+            auto newdir = exdir / dirname[d];
+            if (!fs::create_directory(newdir, ec)) {
+                EFMT_SYS(ec.value(),
+                         "Failed to create export subdirectory {}",
+                         newdir.native());
+            }
+            bp::system(
+                fmt::format(FMT_STRING("{} -o bind {} {}"), mountp.native(),
+                            mdir[d].native(), newdir.native()),
+                ec);
+            if (ec.value() != 0) {
+                EFMT_SYS(ec.value(), "Failed to bind mount {} to {}",
+                         mdir[d].native(), newdir.native());
+            }
+        }
+
         // Export mount directories.
+
         auto ef = std::ofstream{};
         ef.exceptions(std::ofstream::failbit);
         ef.open(exports, std::ios_base::trunc);
         ef << "### BEGIN paramount\n";
 
-        auto muuid = std::vector<std::string>{};
+        // auto muuid = std::vector<std::string>{};
 
-        for (int d = 0; d < ctx.threads; d++) {
-            auto us = fmt::format(
-                FMT_STRING("00000000-0000-0000-0000-00000000{:04x}"), d);
-            muuid.push_back(us);
-            auto opts =
-                fmt::format("rw,no_subtree_check,no_root_squash,fsid={}", us);
-            VERBOSE(ctx, "options: {}", opts);
-            ef << mdir[d] << "\t*(" << opts << ")\n";
-        }
+        // for (int d = 0; d < ctx.threads; d++) {
+        //     auto us = fmt::format(
+        //         FMT_STRING("00000000-0000-0000-0000-00000000{:04x}"), d);
+        //     muuid.push_back(us);
+        //     auto opts =
+        //         fmt::format("rw,no_subtree_check,no_root_squash,fsid={}",
+        //         us);
+        //     VERBOSE(ctx, "options: {}", opts);
+        //     // ef << mdir[d] << "\t*(" << opts << ")\n";
+        // }
+
+        // Export the root directory for the NFS pseudo filesystem.
+        ef << exdir.native()
+           << " *(rw,no_subtree_check,no_root_squash,fsid=root)\n";
         ef << "### END paramount\n";
         ef.close();
 
@@ -197,7 +242,7 @@ int main(int argc, char* argv[]) {
 
         // Map together.
         for (int d = 0; d < ctx.threads; d++) {
-            m_to_c[mdir[d]] = cdir[d];
+            m_to_c["127.0.0.1:/" + dirname[d]] = cdir[d];
         }
 
         // Mount each.
@@ -205,20 +250,19 @@ int main(int argc, char* argv[]) {
         auto mounters = std::vector<mountfut>{};
 
         auto start_barrier = boost::barrier(ctx.threads + 1);
-        auto mountp = bp::search_path("mount");
 
         for (int d = 0; d < ctx.threads; d++) {
             VERBOSE(ctx, "Start mounter {}", d);
             mounters.emplace_back(std::async(
-                std::launch::async, [cd = cdir[d], ctx, d, md = mdir[d],
-                                     mountp, &start_barrier, u = muuid[d]]() {
+                std::launch::async, [cd = cdir[d], ctx, d, dir = dirname[d],
+                                     md = mdir[d], mountp, &start_barrier]() {
                     start_barrier.wait();
                     VERBOSE(ctx, "mounter {} mdir {} mount on cdir {}", d,
                             md.native(), cd.native());
                     auto cmdline = fmt::format(
                         FMT_STRING(
-                            "{} -t nfs -o rw,nfsvers=3 127.0.0.1:{} {}"),
-                        mountp.native(), md.native(), cd.native());
+                            "{} -t nfs -o rw,nfsvers=4.2 127.0.0.1:{} {}"),
+                        mountp.native(), "/" + dir, cd.native());
                     VERBOSE(ctx, "mounter {} cmd '{}'", d, cmdline);
                     std::error_code ec;
                     bp::system(cmdline, ec);
@@ -241,43 +285,55 @@ int main(int argc, char* argv[]) {
             std::cerr << "Got " << failures << " mount failures\n";
         }
 
-        // Scan /proc/mounts.
-        VERBOSE(ctx, "Scan mounts");
-        auto mstr = std::ifstream{};
-        auto old_e = mstr.exceptions();
-        mstr.exceptions(std::iostream::failbit);
-        mstr.open("/proc/self/mounts");
-        mstr.exceptions(old_e);
+        size_t nmounts = 0;
+        do {
+            // Scan /proc/mounts.
+            VERBOSE(ctx, "Scan mounts");
+            auto mstr = std::ifstream{};
+            auto old_e = mstr.exceptions();
+            mstr.exceptions(std::iostream::failbit);
+            mstr.open("/proc/self/mounts");
+            mstr.exceptions(old_e);
 
-        auto mline = std::vector<std::string>{};
-        for (std::string line; std::getline(mstr, line);)
-            mline.push_back(line);
-        mstr.close();
+            auto mline = std::vector<std::string>{};
+            for (std::string line; std::getline(mstr, line);)
+                mline.push_back(line);
+            mstr.close();
 
-        for (const auto& mount : mline) {
-            auto fields = std::vector<std::string>{};
-            // fields:
-            // 0      1          2          3       4        5
-            // device mountpoint filesystem options dontcare dontcare
-            boost::split(fields, mount, boost::is_any_of(" "),
-                         boost::token_compress_on);
-            if (fields[1] != "nfs" && fields[1] != "nfs4") {
-                continue;
-            }
+            nmounts = 0;
+            for (const auto& mount : mline) {
+                auto fields = std::vector<std::string>{};
+                // fields:
+                // 0      1          2          3       4        5
+                // device mountpoint filesystem options dontcare dontcare
+                boost::split(fields, mount, boost::is_any_of(" "),
+                             boost::token_compress_on);
+                if (fields[2] != "nfs" && fields[2] != "nfs4") {
+                    continue;
+                }
+                nmounts++;
 
-            // Check mount-to-client-mountpoint.
-            auto m = fields[0];
-            auto c = fields[1];
-            auto srch = m_to_c.find(m);
-            if (srch == m_to_c.end()) {
-                EFMT("Mount '{}' not found in map", m);
+                // Check mount-to-client-mountpoint.
+                auto m = fields[0];
+                auto c = fields[1];
+                auto srch = m_to_c.find(m);
+                if (srch == m_to_c.end()) {
+                    EFMT("Mount '{}' not found in map", m);
+                }
+                if (srch->second != c) {
+                    EFMT("Mount '{}' expected mountpoint {} found {}", m, c,
+                         srch->second);
+                }
             }
-            if (srch->second != c) {
-                EFMT("Mount '{}' expected mountpoint {} found {}", m, c,
-                     srch->second);
-            }
+        } while (cleanup && nmounts < ctx.threads);
+
+        if (nmounts != ctx.threads) {
+            std::cerr << fmt::format(
+                FMT_STRING("NOTE: expected {} mounts, got {}\n"), ctx.threads,
+                nmounts);
+        } else {
+            VERBOSE(ctx, "Mounts check out");
         }
-        VERBOSE(ctx, "Mounts check out");
 
     } catch (std::exception& e) {
         std::cerr << "Caught exception: " << e.what() << "\n";
