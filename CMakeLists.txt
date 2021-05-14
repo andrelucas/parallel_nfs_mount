@@ -26,4 +26,6 @@ target_link_libraries(paramount
     Boost::system
     Boost::thread
     fmt::fmt
+    libstdc++fs.a
 )
+
