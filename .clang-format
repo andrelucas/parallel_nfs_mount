@@ -1,0 +1,12 @@
+---
+BasedOnStyle: Chromium
+ColumnLimit: 78
+IndentWidth: 4
+---
+Language: Cpp
+BinPackParameters: false
+DerivePointerAlignment: true
+PointerAlignment: Right
+SpacesInContainerLiterals: false
+SortIncludes: true
+IndentPPDirectives: BeforeHash
